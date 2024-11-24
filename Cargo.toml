@@ -1,0 +1,10 @@
+[package]
+name = "sfw"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ndisapi = "0.6.0"
+serde_json = "1.0.133"
+windows = { version = "0.54.0", features = ["Win32_Networking_WinSock"] }
+serde = { version = "1.0.215", features = ["derive"] }

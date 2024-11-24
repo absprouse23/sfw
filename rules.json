@@ -1,0 +1,13 @@
+[
+  {
+    "action": "deny",
+    "protocol": "any",
+    "source_address": "192.168.133.1",
+    "destination_address": "any",
+    "source_port": "any",
+    "destination_port": "any",
+    "direction": "inbound",
+    "logging": true,
+    "enabled": true
+  }
+]
