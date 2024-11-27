@@ -1,190 +1,284 @@
-use ndisapi::{DataLinkLayerFilter, DirectionFlags, FilterLayerFlags, IpAddressV4, IpAddressV4Union, IpRangeV4, IpSubnetV4, IpV4Filter, IpV4FilterFlags, Ndisapi, NetworkLayerFilter, NetworkLayerFilterUnion, StaticFilter, StaticFilterTable, TransportLayerFilter, FILTER_PACKET_DROP, FILTER_PACKET_DROP_RDR, FILTER_PACKET_PASS, FILTER_PACKET_PASS_RDR, IPV4, IP_SUBNET_V4_TYPE};
-use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::BufReader;
-use std::net::Ipv4Addr;
-use std::str::FromStr;
-use std::vec::*;
-use windows::Win32::Networking::WinSock::{IN_ADDR, IN_ADDR_0, IN_ADDR_0_0};
+/// This example demonstrates the essential usage of active filtering modes for packet processing. It selects a
+/// network interface and sets it into a filtering mode, where both sent and received packets are queued. The example
+/// registers a Win32 event using the `Ndisapi::set_packet_event` function, and enters a waiting state for incoming packets.
+/// Upon receiving a packet, its content is decoded and displayed on the console screen, providing a real-time view of
+/// the network traffic.
+use clap::Parser;
+use ndisapi::{
+    DirectionFlags, EthRequest, EthRequestMut, FilterFlags, IntermediateBuffer, Ndisapi, MacAddress, PacketOidData, RasLinks
+};
+use smoltcp::wire::{
+    ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4Packet, Icmpv6Packet, IpProtocol, Ipv4Packet,
+    Ipv6Packet, TcpPacket, UdpPacket,
+};
+use windows::{
+    core::Result,
+    Win32::Foundation::{CloseHandle, HANDLE},
+    Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject},
+};
+use std::{
+    mem::{self, size_of},
+    ptr::write_bytes,
+};
 
-const IPPROTO_ICMP: u8 = 1;
-const IPPROTO_TCP: u8 = 6;
-const IPPROTO_UDP: u8 = 17;
-const FILTER_TABLE_SIZE: usize = 256;
-#[derive(Debug, Serialize, Deserialize)]
-struct JsonFirewallRule {
-    action: String,
-    protocol: String,
-    source_address: String,
-    destination_address: String,
-    source_port: String,
-    destination_port: String,
-    direction: String,
-    logging: bool,
-    enabled: bool,
-}
+// #[derive(Parser)]
+// struct Cli {
+//     /// Network interface index (please use listadapters example to determine the right one)
+//     #[clap(short, long)]
+//     interface_index: usize,
+//     /// Number of packets to read from the specified network interface
+//     #[clap(short, long)]
+//     packets_number: usize,
+// }
 
+fn main() -> Result<()> {
+    // Parse command line arguments and extract interface index and number of packets
+    // let Cli {
+    //     mut interface_index,
+    //     mut packets_number,
+    // } = Cli::parse();
 
+    // Subtract 1 from interface index to convert from 1-based to 0-based indexing
+    let interface_index = 3;
 
-fn create_filter_rule(rule: &JsonFirewallRule) -> Result<StaticFilter, &'static str> {
-    let direction_flags = match rule.direction.as_str() {
-        "inbound" => DirectionFlags::PACKET_FLAG_ON_RECEIVE,
-        "outbound" => DirectionFlags::PACKET_FLAG_ON_SEND,
-        "both" => DirectionFlags::PACKET_FLAG_ON_SEND | DirectionFlags::PACKET_FLAG_ON_RECEIVE,
-        _ => return Err(r#"Invalid direction specified"#),
-    };
+    let driver = Ndisapi::new("NDISRD").expect("WinpkFilter driver is not installed or failed to load!");
 
-    let action = match rule.action.as_str() {
-        "allow" => match rule.logging {
-            true => FILTER_PACKET_PASS_RDR, // Send the packet, but make a copy and send it back to us for logging
-            false => FILTER_PACKET_PASS
-        },
-        "deny" => match rule.logging {
-            true => FILTER_PACKET_DROP_RDR,
-            false => FILTER_PACKET_DROP
-        },
-        _ => return Err(r#"Invalid action specified"#),
-    };
-    
-    let protocol_flags = match rule.protocol.as_str() {
-        "tcp" => IPPROTO_TCP,
-        "udp" => IPPROTO_UDP,
-        "icmp" => IPPROTO_ICMP,
-        "any" => IPPROTO_UDP | IPPROTO_TCP | IPPROTO_ICMP,
-        _ => return Err(r#"Invalid protocol specified"#),
-    };
+    // Get information about TCP/IP adapters bound to the driver
+    let adapters = driver.get_tcpip_bound_adapters_info()?;
 
-    let filter_flags = FilterLayerFlags::NETWORK_LAYER_VALID;
+    // If the specified interface index is greater than the number of available interfaces, panic with an error message
+    if interface_index + 1 > adapters.len() {
+        panic!("Interface index is beyond the number of available interfaces");
+    }
 
-    //TODO: For now we only can block a single host, will add range and subnet in future
-    // let ip_filter = IpV4Filter::new(
-    //     // Filter all fields, actual filtering should occur based on defined parameters
-    //     IpV4FilterFlags::IP_V4_FILTER_PROTOCOL | IpV4FilterFlags::IP_V4_FILTER_DEST_ADDRESS | IpV4FilterFlags::IP_V4_FILTER_SRC_ADDRESS,
-    //     IpAddressV4::new( // src addr
-    //         IP_SUBNET_V4_TYPE,
-    //         IpAddressV4Union {
-    //             ip_range: IpRangeV4::new(
-    //                 IN_ADDR {
-    //                     S_un: IN_ADDR_0 {
-    //                         S_addr: u32::from(Ipv4Addr::from_str(rule.source_address.as_str()).unwrap())
-    //                     }
-    //                 },
-    //                 IN_ADDR {
-    //                     S_un: IN_ADDR_0 {
-    //                         S_addr: u32::from(Ipv4Addr::from_str(rule.source_address.as_str()).unwrap())
-    //                     }
-    //                 }
-    //             )
-    //         },
-    //     ),
-    //     IpAddressV4::new( // src addr
-    //                       IP_SUBNET_V4_TYPE,
-    //                       IpAddressV4Union {
-    //                           ip_range: IpRangeV4::new(
-    //                               IN_ADDR {
-    //                                   S_un: IN_ADDR_0 {
-    //                                       S_addr: u32::from(Ipv4Addr::from_str(rule.source_address.as_str()).unwrap())
-    //                                   }
-    //                               },
-    //                               IN_ADDR {
-    //                                   S_un: IN_ADDR_0 {
-    //                                       S_addr: u32::from(Ipv4Addr::from_str(rule.source_address.as_str()).unwrap())
-    //                                   }
-    //                               }
-    //                           )
-    //                       },
-    //     ),
-    //     protocol_flags
-    // );
+    for (index, adapter) in adapters.iter().enumerate() {
+        // Display the information about each network interface provided by the get_tcpip_bound_adapters_info
+        let network_interface_name = Ndisapi::get_friendly_adapter_name(adapter.get_name())
+            .expect("Unknown network interface");
+        println!(
+            "{}. {}\n\t{}",
+            index + 1,
+            network_interface_name,
+            adapter.get_name(),
+        );
+        println!("\t Medium: {}", adapter.get_medium());
+        println!(
+            "\t MAC: {}",
+            MacAddress::from_slice(adapter.get_hw_address()).unwrap_or_default()
+        );
+        println!("\t MTU: {}", adapter.get_mtu());
+        println!(
+            "\t FilterFlags: {:?}",
+            driver.get_adapter_mode(adapter.get_handle()).unwrap()
+        );
 
-
-    Ok(StaticFilter::new(
-        0,
-        DirectionFlags::PACKET_FLAG_ON_RECEIVE,
-        FILTER_PACKET_DROP, 
-        filter_flags, 
-        DataLinkLayerFilter::default(), 
-        NetworkLayerFilter::new(
-            IPV4,
-            NetworkLayerFilterUnion {
-                ipv4: IpV4Filter::new(
-                    IpV4FilterFlags::IP_V4_FILTER_PROTOCOL
-                        | IpV4FilterFlags::IP_V4_FILTER_SRC_ADDRESS,
-                    IpAddressV4::default(),
-                    IpAddressV4::new(
-                        IP_SUBNET_V4_TYPE,
-                        IpAddressV4Union {
-                            ip_subnet: IpSubnetV4::new(
-                                IN_ADDR {
-                                    S_un: IN_ADDR_0 {
-                                        S_un_b: IN_ADDR_0_0 {
-                                            s_b1: 192,
-                                            s_b2: 168,
-                                            s_b3: 133,
-                                            s_b4: 1,
-                                        },
-                                    },
-                                },
-                                IN_ADDR {
-                                    S_un: IN_ADDR_0 {
-                                        S_un_b: IN_ADDR_0_0 {
-                                            s_b1: 255,
-                                            s_b2: 255,
-                                            s_b3: 255,
-                                            s_b4: 255,
-                                        },
-                                    },
-                                },
-                            ),
-                        },
-                    ),
-                    IPPROTO_TCP,
-                ),
+        // Query hardware packet filter for the adapter using built wrapper for ndis_get_request
+        match driver.get_hw_packet_filter(adapter.get_handle()) {
+            Err(err) => println!(
+                "Getting OID_GEN_CURRENT_PACKET_FILTER Error: {}",
+                err.message()
+            ),
+            Ok(current_packet_filter) => {
+                println!("\t OID_GEN_CURRENT_PACKET_FILTER: 0x{current_packet_filter:08X}")
             }
-        ), 
-        TransportLayerFilter::default()
-        )
-    )
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let driver = Ndisapi::new("NDISRD").expect("Failed driver connection");
-    // Load JSON file
-    let file = File::open("rules.json")?;
-    let reader = BufReader::new(file);
-
-    // Deserialize JSON into a Vec of FirewallRule
-    let rules: Vec<JsonFirewallRule> = serde_json::from_reader(reader).unwrap();
-    
-    for rule in &rules {
-        println!("{:?}", rule);
-    }
-
-    let mut compiled_filters: Vec<StaticFilter> = Vec::new();
-
-    for rule in &rules {
-        compiled_filters.push(create_filter_rule(rule)?);
-    }
-
-    let mut static_filters_list = [StaticFilter::new(
-        0,
-        DirectionFlags::PACKET_FLAG_ON_SEND | DirectionFlags::PACKET_FLAG_ON_RECEIVE,
-        FILTER_PACKET_PASS,
-        FilterLayerFlags::empty(),
-        DataLinkLayerFilter::default(),
-        NetworkLayerFilter::default(),
-        TransportLayerFilter::default()); 256];
-    
-    static_filters_list.iter_mut().zip(compiled_filters.iter()).for_each(|(arr_item, &vec_item)|
-        {
-            *arr_item = vec_item;
         }
+    }
+
+    // Print a message showing the interface name and the number of packets being used.
+    println!(
+        "Using interface {}",
+        adapters[interface_index].get_name(),
     );
 
-    let filter_table = StaticFilterTable::<FILTER_TABLE_SIZE>::from_filters(static_filters_list);
+    // Create a Win32 event for packet handling.
+    let event: HANDLE;
+    unsafe {
+        event = CreateEventW(None, true, false, None)?; // Creating a Win32 event without a name.
+    }
 
-    driver.set_packet_filter_table(&filter_table).expect("TODO: panic message");
-    println!("{}", driver.get_packet_filter_table_size().unwrap());
+    // Set the created event within the driver to signal completion of packet handling.
+    driver.set_packet_event(adapters[interface_index].get_handle(), event)?;
 
+    // Put the network interface into tunnel mode by setting it's filter flags.
+    driver.set_adapter_mode(
+        adapters[interface_index].get_handle(),
+        FilterFlags::MSTCP_FLAG_SENT_RECEIVE_TUNNEL,
+    )?;
+
+    // Allocate single IntermediateBuffer on the stack
+    let mut packet = IntermediateBuffer::default();
+
+    // Loop through all the packets from the network until we are done.
+    loop {
+        unsafe {
+            WaitForSingleObject(event, u32::MAX); // Wait for the event to finish before continuing.
+        }
+
+        loop {
+            // Initialize EthPacketMut to pass to driver API
+            let mut read_request = EthRequestMut::new(adapters[interface_index].get_handle());
+
+            read_request.set_packet(&mut packet);
+
+            if driver.read_packet(&mut read_request).ok().is_none() {
+                break;
+            }
+
+            // Store the direction flags
+            let direction_flags = packet.get_device_flags();
+
+            // Print packet information
+            if direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
+                println!(
+                    "\nMSTCP --> Interface ({} bytes)\n",
+                    packet.get_length(),
+                );
+            } else {
+                println!(
+                    "\nInterface --> MSTCP ({} bytes)\n",
+                    packet.get_length(),
+                );
+            }
+
+            // Decrement the number of packets.
+
+            // Print some information about the sliced packet
+            //print_packet_info(&packet);
+
+            let mut write_request = EthRequest::new(adapters[interface_index].get_handle());
+            write_request.set_packet(&packet);
+
+            // Re-inject the packet back into the network stack
+            if direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
+                match driver.send_packet_to_adapter(&write_request) {
+                    Ok(_) => {}
+                    Err(err) => println!("Error sending packet to adapter. Error code = {err}"),
+                };
+            } else {
+                match driver.send_packet_to_mstcp(&write_request) {
+                    Ok(_) => {}
+                    Err(err) => println!("Error sending packet to mstcp. Error code = {err}"),
+                }
+            }
+        }
+
+        let _ = unsafe {
+            ResetEvent(event) // Reset the event to continue waiting for packets to arrive.
+        };
+    }
+
+    // Put the network interface into default mode.
+    driver.set_adapter_mode(
+        adapters[interface_index].get_handle(),
+        FilterFlags::default(),
+    )?;
+
+    let _ = unsafe {
+        CloseHandle(event) // Close the event handle.
+    };
+
+    // Return the result.
     Ok(())
+}
+
+/// Print detailed information about a network packet.
+///
+/// This function takes an `IntermediateBuffer` containing a network packet and prints various
+/// details about the packet, such as Ethernet, IPv4, IPv6, ICMPv4, ICMPv6, UDP, and TCP information.
+///
+/// # Arguments
+///
+/// * `packet` - A reference to an `IntermediateBuffer` containing the network packet.
+///
+/// # Examples
+///
+/// ```no_run
+/// let packet: IntermediateBuffer = ...;
+/// print_packet_info(&packet);
+/// ```
+fn print_packet_info(packet: &IntermediateBuffer) {
+    let eth_hdr = EthernetFrame::new_unchecked(packet.get_data());
+    match eth_hdr.ethertype() {
+        EthernetProtocol::Ipv4 => {
+            let ipv4_packet = Ipv4Packet::new_unchecked(eth_hdr.payload());
+            println!(
+                "  Ipv4 {:?} => {:?}",
+                ipv4_packet.src_addr(),
+                ipv4_packet.dst_addr()
+            );
+            match ipv4_packet.next_header() {
+                IpProtocol::Icmp => {
+                    let icmp_packet = Icmpv4Packet::new_unchecked(ipv4_packet.payload());
+                    println!(
+                        "ICMPv4: Type: {:?} Code: {:?}",
+                        icmp_packet.msg_type(),
+                        icmp_packet.msg_code()
+                    );
+                }
+                IpProtocol::Tcp => {
+                    let tcp_packet = TcpPacket::new_unchecked(ipv4_packet.payload());
+                    println!(
+                        "   TCP {:?} -> {:?}",
+                        tcp_packet.src_port(),
+                        tcp_packet.dst_port()
+                    );
+                }
+                IpProtocol::Udp => {
+                    let udp_packet = UdpPacket::new_unchecked(ipv4_packet.payload());
+                    println!(
+                        "   UDP {:?} -> {:?}",
+                        udp_packet.src_port(),
+                        udp_packet.dst_port()
+                    );
+                }
+                _ => {
+                    println!("Unknown IPv4 packet: {:?}", ipv4_packet);
+                }
+            }
+        }
+        EthernetProtocol::Ipv6 => {
+            let ipv6_packet = Ipv6Packet::new_unchecked(eth_hdr.payload());
+            println!(
+                "  Ipv6 {:?} => {:?}",
+                ipv6_packet.src_addr(),
+                ipv6_packet.dst_addr()
+            );
+            match ipv6_packet.next_header() {
+                IpProtocol::Icmpv6 => {
+                    let icmpv6_packet = Icmpv6Packet::new_unchecked(ipv6_packet.payload());
+                    println!(
+                        "ICMPv6 packet: Type: {:?} Code: {:?}",
+                        icmpv6_packet.msg_type(),
+                        icmpv6_packet.msg_code()
+                    );
+                }
+                IpProtocol::Tcp => {
+                    let tcp_packet = TcpPacket::new_unchecked(ipv6_packet.payload());
+                    println!(
+                        "   TCP {:?} -> {:?}",
+                        tcp_packet.src_port(),
+                        tcp_packet.dst_port()
+                    );
+                }
+                IpProtocol::Udp => {
+                    let udp_packet = UdpPacket::new_unchecked(ipv6_packet.payload());
+                    println!(
+                        "   UDP {:?} -> {:?}",
+                        udp_packet.src_port(),
+                        udp_packet.dst_port()
+                    );
+                }
+                _ => {
+                    println!("Unknown IPv6 packet: {:?}", ipv6_packet);
+                }
+            }
+        }
+        EthernetProtocol::Arp => {
+            let arp_packet = ArpPacket::new_unchecked(eth_hdr.payload());
+            println!("ARP packet: {:?}", arp_packet);
+        }
+        EthernetProtocol::Unknown(_) => {
+            println!("Unknown Ethernet packet: {:?}", eth_hdr);
+        }
+    }
 }
