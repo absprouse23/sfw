@@ -5,20 +5,20 @@
 /// the network traffic.
 use clap::Parser;
 use ndisapi::{
-    DirectionFlags, EthRequest, EthRequestMut, FilterFlags, IntermediateBuffer, Ndisapi, MacAddress, PacketOidData, RasLinks
+    DirectionFlags, EthRequest, EthRequestMut, FilterFlags, IntermediateBuffer, MacAddress, Ndisapi
 };
 use smoltcp::wire::{
     ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4Packet, Icmpv6Packet, IpProtocol, Ipv4Packet,
     Ipv6Packet, TcpPacket, UdpPacket,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::io;
+use windows::Win32::System::Threading::SetEvent;
 use windows::{
     core::Result,
     Win32::Foundation::{CloseHandle, HANDLE},
     Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject},
-};
-use std::{
-    mem::{self, size_of},
-    ptr::write_bytes,
 };
 
 // #[derive(Parser)]
@@ -32,32 +32,18 @@ use std::{
 // }
 
 fn main() -> Result<()> {
-    // Parse command line arguments and extract interface index and number of packets
-    // let Cli {
-    //     mut interface_index,
-    //     mut packets_number,
-    // } = Cli::parse();
-
-    // Subtract 1 from interface index to convert from 1-based to 0-based indexing
-    let interface_index = 3;
-
     let driver = Ndisapi::new("NDISRD").expect("WinpkFilter driver is not installed or failed to load!");
 
     // Get information about TCP/IP adapters bound to the driver
     let adapters = driver.get_tcpip_bound_adapters_info()?;
-
-    // If the specified interface index is greater than the number of available interfaces, panic with an error message
-    if interface_index + 1 > adapters.len() {
-        panic!("Interface index is beyond the number of available interfaces");
-    }
 
     for (index, adapter) in adapters.iter().enumerate() {
         // Display the information about each network interface provided by the get_tcpip_bound_adapters_info
         let network_interface_name = Ndisapi::get_friendly_adapter_name(adapter.get_name())
             .expect("Unknown network interface");
         println!(
-            "{}. {}\n\t{}",
-            index + 1,
+            "{}: {}\n\t{}",
+            index,
             network_interface_name,
             adapter.get_name(),
         );
@@ -69,7 +55,7 @@ fn main() -> Result<()> {
         println!("\t MTU: {}", adapter.get_mtu());
         println!(
             "\t FilterFlags: {:?}",
-            driver.get_adapter_mode(adapter.get_handle()).unwrap()
+            driver.get_adapter_mode(adapter.get_handle())?
         );
 
         // Query hardware packet filter for the adapter using built wrapper for ndis_get_request
@@ -81,6 +67,30 @@ fn main() -> Result<()> {
             Ok(current_packet_filter) => {
                 println!("\t OID_GEN_CURRENT_PACKET_FILTER: 0x{current_packet_filter:08X}")
             }
+        }
+    }
+
+    let mut interface_index = 0;
+    let adapter_count = adapters.len() - 1;
+    println!("Select an interface");
+
+    loop {
+        println!("Please enter a number between 0 and {}:", adapter_count);
+
+        // Read user input
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .expect("Failed to read input");
+
+        // Try parsing the input to a number
+        match input.trim().parse::<usize>() {
+            Ok(num) if num <= adapter_count => {
+                interface_index = num;
+                println!("Using interface {}", interface_index);
+                break;
+            }
+            _ => println!("Invalid input. Make sure it is a number between 0 and {}.", adapter_count),
         }
     }
 
@@ -96,6 +106,18 @@ fn main() -> Result<()> {
         event = CreateEventW(None, true, false, None)?; // Creating a Win32 event without a name.
     }
 
+    // Set up a Ctrl-C handler to terminate the packet processing loop
+    let terminate: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let ctrlc_pressed = terminate.clone();
+    ctrlc::set_handler(move || {
+        println!("Ctrl-C was pressed. Terminating...");
+        // Set the atomic flag to exit the loop
+        ctrlc_pressed.store(true, Ordering::SeqCst);
+        // Signal the event to release the loop if there are no packets in the queue
+        let _ = unsafe { SetEvent(event) };
+    })
+    .expect("Error setting Ctrl-C handler");
+
     // Set the created event within the driver to signal completion of packet handling.
     driver.set_packet_event(adapters[interface_index].get_handle(), event)?;
 
@@ -108,8 +130,8 @@ fn main() -> Result<()> {
     // Allocate single IntermediateBuffer on the stack
     let mut packet = IntermediateBuffer::default();
 
-    // Loop through all the packets from the network until we are done.
-    loop {
+    // Loop until we get a ctrl-c
+    while !terminate.load(Ordering::SeqCst) {
         unsafe {
             WaitForSingleObject(event, u32::MAX); // Wait for the event to finish before continuing.
         }
@@ -140,25 +162,27 @@ fn main() -> Result<()> {
                 );
             }
 
-            // Decrement the number of packets.
+            match filter_packet(&packet) {
+                true => {
+                    let mut write_request = EthRequest::new(adapters[interface_index].get_handle());
+                    write_request.set_packet(&packet);
 
-            // Print some information about the sliced packet
-            //print_packet_info(&packet);
-
-            let mut write_request = EthRequest::new(adapters[interface_index].get_handle());
-            write_request.set_packet(&packet);
-
-            // Re-inject the packet back into the network stack
-            if direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
-                match driver.send_packet_to_adapter(&write_request) {
-                    Ok(_) => {}
-                    Err(err) => println!("Error sending packet to adapter. Error code = {err}"),
-                };
-            } else {
-                match driver.send_packet_to_mstcp(&write_request) {
-                    Ok(_) => {}
-                    Err(err) => println!("Error sending packet to mstcp. Error code = {err}"),
+                    // Re-inject the packet back into the network stack
+                    if direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
+                        match driver.send_packet_to_adapter(&write_request) {
+                            Ok(_) => {}
+                            Err(err) => println!("Error sending packet to adapter. Error code = {err}"),
+                        };
+                    } else {
+                        match driver.send_packet_to_mstcp(&write_request) {
+                            Ok(_) => {}
+                            Err(err) => println!("Error sending packet to mstcp. Error code = {err}"),
+                        }
+                    }
                 }
+                false => {
+                    println!("Dropped packet from rule match");
+                } // throw the packet out
             }
         }
 
@@ -196,17 +220,17 @@ fn main() -> Result<()> {
 /// let packet: IntermediateBuffer = ...;
 /// print_packet_info(&packet);
 /// ```
-fn print_packet_info(packet: &IntermediateBuffer) {
+fn filter_packet(packet: &IntermediateBuffer) -> bool {
     let eth_hdr = EthernetFrame::new_unchecked(packet.get_data());
     match eth_hdr.ethertype() {
         EthernetProtocol::Ipv4 => {
             let ipv4_packet = Ipv4Packet::new_unchecked(eth_hdr.payload());
-            println!(
-                "  Ipv4 {:?} => {:?}",
-                ipv4_packet.src_addr(),
-                ipv4_packet.dst_addr()
-            );
-            match ipv4_packet.next_header() {
+            // println!(
+            //     "  Ipv4 {:?} => {:?}",
+            //     ipv4_packet.src_addr(),
+            //     ipv4_packet.dst_addr()
+            // );
+            return match ipv4_packet.next_header() {
                 IpProtocol::Icmp => {
                     let icmp_packet = Icmpv4Packet::new_unchecked(ipv4_packet.payload());
                     println!(
@@ -214,25 +238,29 @@ fn print_packet_info(packet: &IntermediateBuffer) {
                         icmp_packet.msg_type(),
                         icmp_packet.msg_code()
                     );
+                    false
                 }
                 IpProtocol::Tcp => {
                     let tcp_packet = TcpPacket::new_unchecked(ipv4_packet.payload());
-                    println!(
-                        "   TCP {:?} -> {:?}",
-                        tcp_packet.src_port(),
-                        tcp_packet.dst_port()
-                    );
+                    // println!(
+                    //     "   TCP {:?} -> {:?}",
+                    //     tcp_packet.src_port(),
+                    //     tcp_packet.dst_port()
+                    // );
+                    true
                 }
                 IpProtocol::Udp => {
                     let udp_packet = UdpPacket::new_unchecked(ipv4_packet.payload());
-                    println!(
-                        "   UDP {:?} -> {:?}",
-                        udp_packet.src_port(),
-                        udp_packet.dst_port()
-                    );
+                    // println!(
+                    //     "   UDP {:?} -> {:?}",
+                    //     udp_packet.src_port(),
+                    //     udp_packet.dst_port()
+                    // );
+                    true
                 }
                 _ => {
                     println!("Unknown IPv4 packet: {:?}", ipv4_packet);
+                    true
                 }
             }
         }
@@ -243,42 +271,48 @@ fn print_packet_info(packet: &IntermediateBuffer) {
                 ipv6_packet.src_addr(),
                 ipv6_packet.dst_addr()
             );
-            match ipv6_packet.next_header() {
+            return match ipv6_packet.next_header() {
                 IpProtocol::Icmpv6 => {
                     let icmpv6_packet = Icmpv6Packet::new_unchecked(ipv6_packet.payload());
-                    println!(
-                        "ICMPv6 packet: Type: {:?} Code: {:?}",
-                        icmpv6_packet.msg_type(),
-                        icmpv6_packet.msg_code()
-                    );
+                    // println!(
+                    //     "ICMPv6 packet: Type: {:?} Code: {:?}",
+                    //     icmpv6_packet.msg_type(),
+                    //     icmpv6_packet.msg_code()
+                    // );
+                    true
                 }
                 IpProtocol::Tcp => {
                     let tcp_packet = TcpPacket::new_unchecked(ipv6_packet.payload());
-                    println!(
-                        "   TCP {:?} -> {:?}",
-                        tcp_packet.src_port(),
-                        tcp_packet.dst_port()
-                    );
+                    // println!(
+                    //     "   TCP {:?} -> {:?}",
+                    //     tcp_packet.src_port(),
+                    //     tcp_packet.dst_port()
+                    // );
+                    true
                 }
                 IpProtocol::Udp => {
                     let udp_packet = UdpPacket::new_unchecked(ipv6_packet.payload());
-                    println!(
-                        "   UDP {:?} -> {:?}",
-                        udp_packet.src_port(),
-                        udp_packet.dst_port()
-                    );
+                    // println!(
+                    //     "   UDP {:?} -> {:?}",
+                    //     udp_packet.src_port(),
+                    //     udp_packet.dst_port()
+                    // );
+                    true
                 }
                 _ => {
                     println!("Unknown IPv6 packet: {:?}", ipv6_packet);
+                    true
                 }
             }
         }
         EthernetProtocol::Arp => {
             let arp_packet = ArpPacket::new_unchecked(eth_hdr.payload());
             println!("ARP packet: {:?}", arp_packet);
+            return true;
         }
         EthernetProtocol::Unknown(_) => {
             println!("Unknown Ethernet packet: {:?}", eth_hdr);
+            return true;
         }
     }
 }
