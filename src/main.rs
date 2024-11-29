@@ -1,3 +1,5 @@
+mod sfw_state_table;
+
 /// This example demonstrates the essential usage of active filtering modes for packet processing. It selects a
 /// network interface and sets it into a filtering mode, where both sent and received packets are queued. The example
 /// registers a Win32 event using the `Ndisapi::set_packet_event` function, and enters a waiting state for incoming packets.
@@ -149,20 +151,7 @@ fn main() -> Result<()> {
             // Store the direction flags
             let direction_flags = packet.get_device_flags();
 
-            // Print packet information
-            if direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
-                println!(
-                    "\nMSTCP --> Interface ({} bytes)\n",
-                    packet.get_length(),
-                );
-            } else {
-                println!(
-                    "\nInterface --> MSTCP ({} bytes)\n",
-                    packet.get_length(),
-                );
-            }
-
-            match filter_packet(&packet) {
+            match filter_packet(&packet, &direction_flags) {
                 true => {
                     let mut write_request = EthRequest::new(adapters[interface_index].get_handle());
                     write_request.set_packet(&packet);
@@ -220,16 +209,16 @@ fn main() -> Result<()> {
 /// let packet: IntermediateBuffer = ...;
 /// print_packet_info(&packet);
 /// ```
-fn filter_packet(packet: &IntermediateBuffer) -> bool {
+fn filter_packet(packet: &IntermediateBuffer, direction_flags: &DirectionFlags) -> bool {
     let eth_hdr = EthernetFrame::new_unchecked(packet.get_data());
     match eth_hdr.ethertype() {
         EthernetProtocol::Ipv4 => {
             let ipv4_packet = Ipv4Packet::new_unchecked(eth_hdr.payload());
-            // println!(
-            //     "  Ipv4 {:?} => {:?}",
-            //     ipv4_packet.src_addr(),
-            //     ipv4_packet.dst_addr()
-            // );
+            println!(
+                "  Ipv4 {:?} => {:?}",
+                ipv4_packet.src_addr(),
+                ipv4_packet.dst_addr()
+            );
             return match ipv4_packet.next_header() {
                 IpProtocol::Icmp => {
                     let icmp_packet = Icmpv4Packet::new_unchecked(ipv4_packet.payload());
@@ -242,11 +231,11 @@ fn filter_packet(packet: &IntermediateBuffer) -> bool {
                 }
                 IpProtocol::Tcp => {
                     let tcp_packet = TcpPacket::new_unchecked(ipv4_packet.payload());
-                    // println!(
-                    //     "   TCP {:?} -> {:?}",
-                    //     tcp_packet.src_port(),
-                    //     tcp_packet.dst_port()
-                    // );
+                    println!(
+                        "   TCP {:?} -> {:?}",
+                        tcp_packet.src_port(),
+                        tcp_packet.dst_port()
+                    );
                     true
                 }
                 IpProtocol::Udp => {
