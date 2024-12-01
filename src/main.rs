@@ -9,13 +9,12 @@ use clap::Parser;
 use ndisapi::{
     DirectionFlags, EthRequest, EthRequestMut, FilterFlags, IntermediateBuffer, MacAddress, Ndisapi
 };
-use smoltcp::wire::{
-    ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4Packet, Icmpv6Packet, IpProtocol, Ipv4Packet,
-    Ipv6Packet, TcpPacket, UdpPacket,
-};
+use smoltcp::wire::{ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4Packet, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::io;
+use std::time::{Duration, SystemTime};
+use smoltcp::socket::tcp::State;
 use windows::Win32::System::Threading::SetEvent;
 use windows::{
     core::Result,
@@ -23,15 +22,7 @@ use windows::{
     Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject},
 };
 
-// #[derive(Parser)]
-// struct Cli {
-//     /// Network interface index (please use listadapters example to determine the right one)
-//     #[clap(short, long)]
-//     interface_index: usize,
-//     /// Number of packets to read from the specified network interface
-//     #[clap(short, long)]
-//     packets_number: usize,
-// }
+use sfw_state_table::{ConnectionTable, StateTableEntry, StateTableKey};
 
 fn main() -> Result<()> {
     let driver = Ndisapi::new("NDISRD").expect("WinpkFilter driver is not installed or failed to load!");
@@ -128,56 +119,41 @@ fn main() -> Result<()> {
         adapters[interface_index].get_handle(),
         FilterFlags::MSTCP_FLAG_SENT_RECEIVE_TUNNEL,
     )?;
+    
+    // Create our connection state table
+    let mut connection_table = ConnectionTable::new();
 
     // Allocate single IntermediateBuffer on the stack
     let mut packet = IntermediateBuffer::default();
 
     // Loop until we get a ctrl-c
+
     while !terminate.load(Ordering::SeqCst) {
-        unsafe {
-            WaitForSingleObject(event, u32::MAX); // Wait for the event to finish before continuing.
-        }
+        unsafe { WaitForSingleObject(event, u32::MAX) };
 
         loop {
-            // Initialize EthPacketMut to pass to driver API
             let mut read_request = EthRequestMut::new(adapters[interface_index].get_handle());
-
             read_request.set_packet(&mut packet);
 
-            if driver.read_packet(&mut read_request).ok().is_none() {
+            if driver.read_packet(&mut read_request).is_err() {
                 break;
             }
 
-            // Store the direction flags
             let direction_flags = packet.get_device_flags();
 
-            match filter_packet(&packet, &direction_flags) {
-                true => {
-                    let mut write_request = EthRequest::new(adapters[interface_index].get_handle());
-                    write_request.set_packet(&packet);
-
-                    // Re-inject the packet back into the network stack
-                    if direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
-                        match driver.send_packet_to_adapter(&write_request) {
-                            Ok(_) => {}
-                            Err(err) => println!("Error sending packet to adapter. Error code = {err}"),
-                        };
-                    } else {
-                        match driver.send_packet_to_mstcp(&write_request) {
-                            Ok(_) => {}
-                            Err(err) => println!("Error sending packet to mstcp. Error code = {err}"),
-                        }
-                    }
+            if filter_packet(&packet, &direction_flags, &mut connection_table) {
+                let mut write_request = EthRequest::new(adapters[interface_index].get_handle());
+                write_request.set_packet(&packet);
+            
+                if direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
+                    driver.send_packet_to_adapter(&write_request).ok();
+                } else {
+                    driver.send_packet_to_mstcp(&write_request).ok();
                 }
-                false => {
-                    println!("Dropped packet from rule match");
-                } // throw the packet out
             }
         }
 
-        let _ = unsafe {
-            ResetEvent(event) // Reset the event to continue waiting for packets to arrive.
-        };
+        unsafe { let _ = ResetEvent(event); };
     }
 
     // Put the network interface into default mode.
@@ -193,115 +169,132 @@ fn main() -> Result<()> {
     // Return the result.
     Ok(())
 }
-
-/// Print detailed information about a network packet.
-///
-/// This function takes an `IntermediateBuffer` containing a network packet and prints various
-/// details about the packet, such as Ethernet, IPv4, IPv6, ICMPv4, ICMPv6, UDP, and TCP information.
-///
-/// # Arguments
-///
-/// * `packet` - A reference to an `IntermediateBuffer` containing the network packet.
-///
-/// # Examples
-///
-/// ```no_run
-/// let packet: IntermediateBuffer = ...;
-/// print_packet_info(&packet);
-/// ```
-fn filter_packet(packet: &IntermediateBuffer, direction_flags: &DirectionFlags) -> bool {
+// 
+fn filter_packet(
+    packet: &IntermediateBuffer,
+    direction_flags: &DirectionFlags,
+    connection_table: &mut ConnectionTable,
+) -> bool {
     let eth_hdr = EthernetFrame::new_unchecked(packet.get_data());
+
     match eth_hdr.ethertype() {
         EthernetProtocol::Ipv4 => {
             let ipv4_packet = Ipv4Packet::new_unchecked(eth_hdr.payload());
-            println!(
-                "  Ipv4 {:?} => {:?}",
-                ipv4_packet.src_addr(),
-                ipv4_packet.dst_addr()
-            );
-            return match ipv4_packet.next_header() {
-                IpProtocol::Icmp => {
-                    let icmp_packet = Icmpv4Packet::new_unchecked(ipv4_packet.payload());
-                    println!(
-                        "ICMPv4: Type: {:?} Code: {:?}",
-                        icmp_packet.msg_type(),
-                        icmp_packet.msg_code()
-                    );
-                    false
-                }
+
+            match ipv4_packet.next_header() {
                 IpProtocol::Tcp => {
                     let tcp_packet = TcpPacket::new_unchecked(ipv4_packet.payload());
-                    println!(
-                        "   TCP {:?} -> {:?}",
-                        tcp_packet.src_port(),
-                        tcp_packet.dst_port()
-                    );
-                    true
+                    let key = StateTableKey {
+                        source_ip: IpAddress::Ipv4(ipv4_packet.src_addr().into()),
+                        //source_port: tcp_packet.src_port(),
+                        destination_ip: IpAddress::Ipv4(ipv4_packet.dst_addr().into()),
+                        //destination_port: tcp_packet.dst_port(),
+                    };
+
+                    if *direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
+                        // Outgoing packet: Add the entry to the connection table
+                        connection_table.handle_outgoing_connection(key, IpProtocol::Tcp);
+                        true
+                    } else if connection_table.handle_incoming_connection(&key) {
+                        true
+                    } else {
+                        dbg!("Dropped incoming TCP packet: {:?}", key);
+                        false
+                    }
                 }
                 IpProtocol::Udp => {
                     let udp_packet = UdpPacket::new_unchecked(ipv4_packet.payload());
-                    // println!(
-                    //     "   UDP {:?} -> {:?}",
-                    //     udp_packet.src_port(),
-                    //     udp_packet.dst_port()
-                    // );
-                    true
+                    let key = StateTableKey {
+                        source_ip: IpAddress::Ipv4(ipv4_packet.src_addr().into()),
+                        //source_port: udp_packet.src_port(),
+                        destination_ip: IpAddress::Ipv4(ipv4_packet.dst_addr().into()),
+                        //destination_port: udp_packet.dst_port(),
+                    };
+
+                    if *direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
+                        // Outgoing packet: Add the entry to the connection table
+                        connection_table.handle_outgoing_connection(key, IpProtocol::Udp);
+                        true
+                    } else {
+                        // Incoming packet: Flip src/dest and check if exists in the connection table
+                        if connection_table.handle_incoming_connection(&key) {
+                            true
+                        } else {
+                            dbg!("Dropped incoming UDP packet: {:?}", key);
+                            false
+                        }
+                    }
                 }
                 _ => {
-                    println!("Unknown IPv4 packet: {:?}", ipv4_packet);
-                    true
+                    // Unsupported protocol, drop the packet
+                    dbg!("Dropped packet with unsupported IPv4 protocol: {:?}", ipv4_packet.next_header());
+                    false
                 }
             }
         }
         EthernetProtocol::Ipv6 => {
             let ipv6_packet = Ipv6Packet::new_unchecked(eth_hdr.payload());
-            println!(
-                "  Ipv6 {:?} => {:?}",
-                ipv6_packet.src_addr(),
-                ipv6_packet.dst_addr()
-            );
-            return match ipv6_packet.next_header() {
-                IpProtocol::Icmpv6 => {
-                    let icmpv6_packet = Icmpv6Packet::new_unchecked(ipv6_packet.payload());
-                    // println!(
-                    //     "ICMPv6 packet: Type: {:?} Code: {:?}",
-                    //     icmpv6_packet.msg_type(),
-                    //     icmpv6_packet.msg_code()
-                    // );
-                    true
-                }
+
+            match ipv6_packet.next_header() {
                 IpProtocol::Tcp => {
                     let tcp_packet = TcpPacket::new_unchecked(ipv6_packet.payload());
-                    // println!(
-                    //     "   TCP {:?} -> {:?}",
-                    //     tcp_packet.src_port(),
-                    //     tcp_packet.dst_port()
-                    // );
-                    true
+                    let key = StateTableKey {
+                        source_ip: IpAddress::Ipv6(ipv6_packet.src_addr().into()),
+                        //source_port: tcp_packet.src_port(),
+                        destination_ip: IpAddress::Ipv6(ipv6_packet.dst_addr().into()),
+                        //destination_port: tcp_packet.dst_port(),
+                    };
+
+                    if *direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
+                        // Outgoing packet: Add the entry to the connection table
+                        connection_table.handle_outgoing_connection(key, IpProtocol::Tcp);
+                        true
+                    } else if connection_table.handle_incoming_connection(&key) {
+                        true
+                    } else {
+                        dbg!("Dropped incoming TCP packet (IPv6): {:?}", key);
+                        false
+                    }
                 }
                 IpProtocol::Udp => {
                     let udp_packet = UdpPacket::new_unchecked(ipv6_packet.payload());
-                    // println!(
-                    //     "   UDP {:?} -> {:?}",
-                    //     udp_packet.src_port(),
-                    //     udp_packet.dst_port()
-                    // );
-                    true
+                    let key = StateTableKey {
+                        source_ip: IpAddress::Ipv6(ipv6_packet.src_addr().into()),
+                        //source_port: udp_packet.src_port(),
+                        destination_ip: IpAddress::Ipv6(ipv6_packet.dst_addr().into()),
+                        //destination_port: udp_packet.dst_port(),
+                    };
+
+                    if *direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
+                        // Outgoing packet: Add the entry to the connection table
+                        connection_table.handle_outgoing_connection(key, IpProtocol::Udp);
+                        true
+                    } else if connection_table.handle_incoming_connection(&key) {
+                        true
+                    } else {
+                        dbg!("Dropped incoming UDP packet (IPv6): {:?}", key);
+                        false
+                    }
                 }
                 _ => {
-                    println!("Unknown IPv6 packet: {:?}", ipv6_packet);
-                    true
+                    // Unsupported protocol, drop the packet
+                    dbg!("Dropped packet with unsupported IPv6 protocol: {:?}", ipv6_packet.next_header());
+                    false
                 }
             }
         }
         EthernetProtocol::Arp => {
-            let arp_packet = ArpPacket::new_unchecked(eth_hdr.payload());
-            println!("ARP packet: {:?}", arp_packet);
-            return true;
+            true
         }
-        EthernetProtocol::Unknown(_) => {
-            println!("Unknown Ethernet packet: {:?}", eth_hdr);
-            return true;
+        _ => {
+            // Unsupported Ethernet protocol, drop the packet
+            dbg!("Dropped packet with unsupported Ethernet protocol: {:?}", eth_hdr.ethertype());
+            false
         }
     }
 }
+
+
+
+
+
