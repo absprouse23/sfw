@@ -95,14 +95,16 @@ impl RulesTable {
 
             // Log if required
             if rule.logging {
-                println!("{}", &rule);
-                println!("{} {} {} {}", packet_info.source_address, packet_info.destination_address, packet_info.source_port, packet_info.destination_port);
+                println!("{:?}", &rule);
+                println!("{:?} {:?} {:?} {:?}", packet_info.source_address, packet_info.destination_address, packet_info.source_port, packet_info.destination_port);
             }
 
             println!("Matched rule {:?}", rule);
             // Determine action
             if rule.action.to_uppercase() == "BLOCK" {
                 return false; // Block the packet
+            } else {
+                return true;
             }
         }
 
