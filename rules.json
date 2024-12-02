@@ -1,13 +1,24 @@
 [
   {
-    "action": "deny",
-    "protocol": "any",
-    "source_address": "192.168.133.1",
-    "destination_address": "any",
-    "source_port": "any",
-    "destination_port": "any",
-    "direction": "inbound",
+    "action": "BLOCK",
+    "protocol": "TCP",
+    "source_address": "192.168.1.100",
+    "destination_address": "10.0.0.1",
+    "source_port": "ANY",
+    "destination_port": "80",
+    "direction": "OUTBOUND",
     "logging": true,
+    "enabled": true
+  },
+  {
+    "action": "ALLOW",
+    "protocol": "ANY",
+    "source_address": "ANY",
+    "destination_address": "ANY",
+    "source_port": "",
+    "destination_port": "",
+    "direction": "ANY",
+    "logging": false,
     "enabled": true
   }
 ]
