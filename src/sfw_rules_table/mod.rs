@@ -94,7 +94,7 @@ impl RulesTable {
             }
 
             // Log if required
-            if rule.logging {
+            if rule.logging { // TODO: Implement better logging
                 println!("{:?}", &rule);
                 println!("{:?} {:?} {:?} {:?}", packet_info.source_address, packet_info.destination_address, packet_info.source_port, packet_info.destination_port);
             }
