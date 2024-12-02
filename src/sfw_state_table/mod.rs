@@ -1,7 +1,7 @@
+use ndisapi::{DirectionFlags, IntermediateBuffer};
 use smoltcp::wire::{EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
-use ndisapi::{DirectionFlags, IntermediateBuffer};
 
 #[derive(Hash, Eq, PartialEq, Debug)]
 pub struct StateTableKey {
@@ -12,7 +12,7 @@ pub struct StateTableKey {
 }
 
 #[derive(Debug)]
-pub struct StateTableEntry {     
+pub struct StateTableEntry {
     pub timeout: SystemTime,        // Expiration time using system clock
 }
 
@@ -38,15 +38,15 @@ impl ConnectionTable {
         let entry = StateTableEntry {
             timeout,
         };
-        
+
         if !self.table.contains_key(&key) {
             dbg!("Inserting new connection key");
             dbg!(&key, &entry);
         }
-        
+
         self.table.entry(key).or_insert(entry);
     }
-    
+
     /// Handle incoming connections - check if an entry exists by flipping the key
     /// If not, drop the packet; otherwise, update the timeout
     pub fn handle_incoming_connection(&mut self, key: &StateTableKey) -> bool {
@@ -67,7 +67,6 @@ impl ConnectionTable {
 
             true // Allow packet
         } else {
-
             false // Drop packet
         }
     }

@@ -2,7 +2,7 @@ mod sfw_rules_table;
 mod sfw_state_table;
 
 use ndisapi::{
-    DirectionFlags, EthRequest, EthRequestMut, FilterFlags, IntermediateBuffer, MacAddress, Ndisapi
+    DirectionFlags, EthRequest, EthRequestMut, FilterFlags, IntermediateBuffer, MacAddress, Ndisapi,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,7 +108,7 @@ fn main() -> Result<()> {
         // Signal the event to release the loop if there are no packets in the queue
         let _ = unsafe { SetEvent(event) };
     })
-    .expect("Error setting Ctrl-C handler");
+        .expect("Error setting Ctrl-C handler");
 
     // Set the created event within the driver to signal completion of packet handling.
     driver.set_packet_event(adapters[interface_index].get_handle(), event)?;
@@ -118,7 +118,7 @@ fn main() -> Result<()> {
         adapters[interface_index].get_handle(),
         FilterFlags::MSTCP_FLAG_SENT_RECEIVE_TUNNEL,
     )?;
-    
+
     // Create our connection state table
     let mut connection_table = ConnectionTable::new();
 
@@ -140,10 +140,10 @@ fn main() -> Result<()> {
 
             let direction_flags = packet.get_device_flags();
 
-            if connection_table.filter_packet(&packet, &direction_flags) && rules_table.filter_packet(&packet, &direction_flags) {
+            if connection_table.filter_packet(&packet, &direction_flags) || rules_table.filter_packet(&packet, &direction_flags) {
                 let mut write_request = EthRequest::new(adapters[interface_index].get_handle());
                 write_request.set_packet(&packet);
-            
+
                 if direction_flags == DirectionFlags::PACKET_FLAG_ON_SEND {
                     driver.send_packet_to_adapter(&write_request).ok();
                 } else {
@@ -172,14 +172,14 @@ fn main() -> Result<()> {
 
 fn get_rules_file_path() -> PathBuf {
     let exe_path = env::current_exe().expect("Failed to get current executable path");
-    
+
     let mut rules_path = exe_path.parent().expect("Failed to get executable directory").to_path_buf();
     rules_path.push("rules.json");
-    
+
     if rules_path.exists() {
         return rules_path;
     }
-    
+
     loop {
         println!("Please enter the full path to the rules.json file: ");
 

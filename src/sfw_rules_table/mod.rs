@@ -2,7 +2,6 @@ use ndisapi::{DirectionFlags, IntermediateBuffer};
 use serde::Deserialize;
 use smoltcp::wire::{EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket};
 use std::fs;
-use crate::sfw_state_table::StateTableKey;
 
 #[derive(Debug, Deserialize)]
 pub struct Rule {
@@ -54,7 +53,7 @@ impl RulesTable {
             }
 
             // Match direction
-            if rule.direction.to_uppercase() != direction_to_string(packet_info.direction) {
+            if rule.direction.to_uppercase() != "ANY" && (rule.direction.to_uppercase() != direction_to_string(packet_info.direction)) {
                 continue;
             }
 
@@ -96,8 +95,8 @@ impl RulesTable {
 
             // Log if required
             if rule.logging {
-                dbg!(&rule);
-                dbg!(packet_info.source_address, packet_info.destination_address, packet_info.source_port, packet_info.destination_port);
+                println!("{}", &rule);
+                println!("{} {} {} {}", packet_info.source_address, packet_info.destination_address, packet_info.source_port, packet_info.destination_port);
             }
 
             println!("Matched rule {:?}", rule);
@@ -107,7 +106,7 @@ impl RulesTable {
             }
         }
 
-        true // Allow packet by default
+        false // Block packet by default
     }
 
     pub fn filter_packet(
@@ -195,7 +194,7 @@ impl RulesTable {
             }
             _ => {
                 // Unsupported Ethernet protocol, drop the packet
-                dbg!("Dropped packet with unsupported Ethernet protocol: {:?}", eth_hdr.ethertype());
+                println!("Dropped packet with unsupported Ethernet protocol: {:?}", eth_hdr.ethertype());
                 false
             }
         }
@@ -214,7 +213,6 @@ fn direction_to_string(direction: DirectionFlags) -> String {
     match direction {
         DirectionFlags::PACKET_FLAG_ON_SEND => "OUTBOUND".to_string(),
         DirectionFlags::PACKET_FLAG_ON_RECEIVE => "INBOUND".to_string(),
-        DirectionFlags::PACKET_FLAG_ON_SEND_RECEIVE => "ANY".to_string(),
         _ => "UNKNOWN".to_string(),
     }
 }
